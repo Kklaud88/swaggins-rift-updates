@@ -1,0 +1,80 @@
+name: Publish Rift update site
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: rift-update-pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Stage verified Windows releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          site = pathlib.Path("site")
+          site.mkdir()
+
+          def order(tag):
+              version, _, prerelease = tag[1:].partition("-")
+              parts = tuple((0, int(p)) if p.isdigit() else (1, p) for p in prerelease.split("."))
+              return tuple(map(int, version.split("."))), not prerelease, parts
+
+          releases = json.loads(subprocess.check_output([
+              "gh", "release", "list", "--repo", repo, "--limit", "100",
+              "--json", "tagName,isDraft"
+          ]))
+          tags = [r["tagName"] for r in releases if not r["isDraft"]
+                  and re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", r["tagName"])]
+          if not tags:
+              raise SystemExit("No published Rift builds found.")
+          for index, tag in enumerate(sorted(tags, key=order, reverse=True)[:2]):
+              version = tag[1:]
+              target = site / "releases" / version
+              target.mkdir(parents=True)
+              subprocess.run(["gh", "release", "download", tag, "--repo", repo,
+                              "--pattern", "SwagginsRift.exe", "--pattern", "latest.json",
+                              "--dir", str(target)], check=True)
+              manifest_path = target / "latest.json"
+              manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+              exe = target / "SwagginsRift.exe"
+              with exe.open("rb") as payload:
+                  sha = hashlib.file_digest(payload, "sha256").hexdigest()
+              if (manifest["product"] != "swaggins-rift-win-x64"
+                      or manifest["version"] != version
+                      or manifest["download"] != f"releases/{version}/SwagginsRift.exe"
+                      or manifest["size"] != exe.stat().st_size
+                      or manifest["sha256"] != sha):
+                  raise SystemExit(f"Release {tag} failed validation.")
+              if index == 0:
+                  (site / "latest.json").write_bytes(manifest_path.read_bytes())
+              manifest_path.unlink()
+          (site / "index.html").write_text(
+              '<!doctype html><meta charset="utf-8"><title>Swaggins Rift updates</title>'
+              '<h1>Swaggins Rift updates</h1><p>Use latest.json as your feed in Rift Settings.</p>',
+              encoding="utf-8")
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
